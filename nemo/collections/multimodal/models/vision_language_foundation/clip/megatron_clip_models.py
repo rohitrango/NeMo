@@ -456,7 +456,7 @@ class MegatronCLIPModel(MegatronBaseModel):
         output_tensor = self.model(image, text)
         return output_tensor
 
-    def fwd_bwd_step(self, dataloader_iter, forward_only):
+    def fwd_bwd_step(self, dataloader_iter, forward_only, return_metrics=False):
 
         # handle asynchronous grad reduction
         no_sync_func = None
@@ -488,6 +488,8 @@ class MegatronCLIPModel(MegatronBaseModel):
             micro_batch_size=self.cfg.micro_batch_size,
         )
 
+        # keep track of any metrics here
+        metrics = {}
         # only the last stages of the pipeline return losses
         if losses_reduced_per_micro_batch:
             if (not forward_only) or self.cfg.data.get('validation_drop_last', True):
@@ -495,6 +497,10 @@ class MegatronCLIPModel(MegatronBaseModel):
                 loss_tensors_list = [loss_reduced['loss'] for loss_reduced in losses_reduced_per_micro_batch]
                 loss_tensor = torch.stack(loss_tensors_list)
                 loss_mean = loss_tensor.mean()
+                # compute metrics too
+                for k in losses_reduced_per_micro_batch[0].keys():
+                    metrics[k] = [loss_reduced[k] for loss_reduced in losses_reduced_per_micro_batch]
+                    metrics[k] = torch.stack(metrics[k]).mean()
             else:
                 # Get the total loss since micro batches sizes are not uniform
                 raise NotImplementedError("Losses of micro batches sizes must be uniform!")
@@ -505,7 +511,10 @@ class MegatronCLIPModel(MegatronBaseModel):
             else:
                 loss_mean = torch.tensor(0.0).cuda()
 
+        if return_metrics:
+            return loss_mean, metrics
         return loss_mean
+
 
     def initialize_ub_func(self):
         ub_cfgs = self.cfg.get('ub_tp_comm_overlap_cfg', None)
@@ -561,7 +570,7 @@ class MegatronCLIPModel(MegatronBaseModel):
                     for param in module.embedding.parameters():
                         param.data_ptr()
 
-        loss_mean = self.fwd_bwd_step(dataloader_iter, False)
+        loss_mean, metrics = self.fwd_bwd_step(dataloader_iter, False, True)
 
         # when using sequence parallelism, the sequence parallel layernorm grads must be all-reduced
         if self.cfg.get('tensor_model_parallel_size', 1) > 1 and self.cfg.get('sequence_parallel', False):
@@ -592,6 +601,9 @@ class MegatronCLIPModel(MegatronBaseModel):
             if loss_scale is not None:
                 self.log('loss_scale', loss_scale, batch_size=1)
 
+        # log metrics here (dont need to because pl lightning will)
+        for k, v in metrics.items():
+            self.log(f'reduced_{k}', v, prog_bar=True, rank_zero_only=True, batch_size=1)
         self.log('reduced_train_loss', loss_mean, prog_bar=True, rank_zero_only=True, batch_size=1)
         lr = self._optimizer.param_groups[0]['lr']
         self.log('lr', lr, rank_zero_only=True, batch_size=1)
@@ -603,7 +615,6 @@ class MegatronCLIPModel(MegatronBaseModel):
             rank_zero_only=True,
             batch_size=1,
         )
-
         return loss_mean
 
     def backward(self, *args, **kwargs):
@@ -753,15 +764,24 @@ class MegatronCLIPModel(MegatronBaseModel):
         if self.initialize_ub:
             self.initialize_ub_func()
 
-        loss = self.fwd_bwd_step(dataloader_iter, True)
-        self.validation_step_outputs.append(loss)
+        loss, metrics = self.fwd_bwd_step(dataloader_iter, True, True)
+        self.validation_step_outputs.append((loss, metrics))
 
-        return loss
+        return loss 
 
     def on_validation_epoch_end(self):
         # TODO (yuya): need fix later, check with Sean
         if not self.validation_step_outputs:
             return
+        
+        # we have both loss and metrics here, else just default behavior
+        val_step_metrics = []
+        if isinstance(self.validation_step_outputs[0], tuple):
+            out0, out1 = [[x[i] for x in self.validation_step_outputs] for i in range(2)]
+            self.validation_step_outputs = out0
+            val_step_metrics = {}
+            for k in out1[0].keys():
+                val_step_metrics[k] = torch.tensor([torch.stack([x[k] for x in out1]).mean()], dtype=torch.float32, device='cuda')
 
         # Run zero shot imagenet evaluation
         if self.imagenet_val is not None:
@@ -777,10 +797,16 @@ class MegatronCLIPModel(MegatronBaseModel):
             )
         else:
             averaged_metrics = torch.tensor([0.0], dtype=torch.float32, device='cuda')
+            for k in val_step_metrics.keys():
+                val_step_metrics[k] = torch.tensor([0.0], dtype=torch.float32, device='cuda') 
 
         # we can only log on one rank if it is rank zero so we broadcast from last rank
         torch.distributed.broadcast(averaged_metrics, get_last_rank())
         averaged_loss = averaged_metrics
+        # gather metrics
+        for k in val_step_metrics.keys():
+            torch.distributed.broadcast(val_step_metrics[k], get_last_rank())
+            self.log(f"val_{k}", val_step_metrics[k], prog_bar=True, rank_zero_only=True, batch_size=1)
 
         self.log('global_step', self.trainer.global_step, prog_bar=True, rank_zero_only=True, batch_size=1)
         self.log('val_loss', averaged_loss, prog_bar=True, rank_zero_only=True, batch_size=1)
