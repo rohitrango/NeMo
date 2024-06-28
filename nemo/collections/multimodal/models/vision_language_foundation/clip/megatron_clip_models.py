@@ -499,7 +499,7 @@ class MegatronCLIPModel(MegatronBaseModel):
                 loss_mean = loss_tensor.mean()
                 # compute metrics too
                 for k in losses_reduced_per_micro_batch[0].keys():
-                    metrics[k] = [[loss_reduced[k] for loss_reduced in losses_reduced_per_micro_batch]]
+                    metrics[k] = [loss_reduced[k] for loss_reduced in losses_reduced_per_micro_batch]
                     metrics[k] = torch.stack(metrics[k]).mean()
             else:
                 # Get the total loss since micro batches sizes are not uniform
