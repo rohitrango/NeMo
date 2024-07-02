@@ -26,8 +26,8 @@ def main(cfg):
         model_cfg.ckpt_path = None
         model_cfg.inductor = False
         model_cfg.unet_config.use_flash_attention = False
-        model_cfg.unet_config.from_pretrained = None
-        model_cfg.first_stage_config.from_pretrained = None
+        # model_cfg.unet_config.from_pretrained = None
+        # model_cfg.first_stage_config.from_pretrained = None
         model_cfg.first_stage_config._target_ = (
             'nemo.collections.multimodal.models.text_to_image.stable_diffusion.ldm.autoencoder.AutoencoderKL'
         )
@@ -38,6 +38,13 @@ def main(cfg):
     )
     model = megatron_diffusion_model.model
     model.cuda().eval()
+
+    with open("test_prompts.txt", "r") as fi:
+        prompts = fi.read().split("\n")
+        prompts = list(filter(lambda x: x != "", prompts))
+        print(f"New prompt list has {len(prompts)} prompts.")
+        print("Replacing existing prompts: ", cfg.infer.prompts)
+        cfg.infer.prompts = prompts
 
     rng = torch.Generator().manual_seed(cfg.infer.seed)
     pipeline(model, cfg, rng=rng)

@@ -19,6 +19,7 @@ from itertools import chain
 
 import torch
 from PIL import Image
+from tqdm import tqdm
 
 from nemo.collections.multimodal.models.text_to_image.stable_diffusion.samplers.ddim import DDIMSampler
 from nemo.collections.multimodal.models.text_to_image.stable_diffusion.samplers.para_ddim import ParaDDIMSampler
@@ -137,11 +138,20 @@ def pipeline(model, cfg, verbose=True, rng=None):
             prompts = [prompts]
 
         multi_prompts = [p for p in prompts for _ in range(num_images_per_prompt)]
+        # get partition for this device 
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        if world_size > 1:
+            indices = torch.linspace(0, len(multi_prompts), world_size+1).int()
+            # for this device
+            multi_prompts = multi_prompts[indices[local_rank]:indices[local_rank+1]]
+            print(f"Running {len(multi_prompts)} images for rank: {local_rank}.")
+
         batched_prompts = [multi_prompts[i : i + batch_size] for i in range(0, len(multi_prompts), batch_size)]
         # decrease batch_size if the number of imputs is lower than bs in the config
         batch_size = min(len(batched_prompts[0]), batch_size)
 
-        for batch in batched_prompts:
+        for batch in tqdm(batched_prompts):
             tic = time.perf_counter()
             tic_total = tic
             cond, u_cond = encode_prompt(model.cond_stage_model, batch, unconditional_guidance_scale,)
@@ -210,7 +220,7 @@ def pipeline(model, cfg, verbose=True, rng=None):
                 for text_prompt, image in zip(prompts, pils):
                     idx = counts[text_prompt]
                     counts[text_prompt] += 1
-                    image.save(os.path.join(out_path, f'{text_prompt[:50]}_{idx}.png'))
+                    image.save(os.path.join(out_path, f'{text_prompt[:50]}_{idx}_{local_rank}.png'))
             else:
                 with open(os.path.join(out_path, 'output.pkl'), 'wb') as f:
                     pickle.dump(output, f)
