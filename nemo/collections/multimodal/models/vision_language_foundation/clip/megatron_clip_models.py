@@ -775,7 +775,7 @@ class MegatronCLIPModel(MegatronBaseModel):
             return
         
         # we have both loss and metrics here, else just default behavior
-        val_step_metrics = []
+        val_step_metrics = {}
         if isinstance(self.validation_step_outputs[0], tuple):
             out0, out1 = [[x[i] for x in self.validation_step_outputs] for i in range(2)]
             self.validation_step_outputs = out0
